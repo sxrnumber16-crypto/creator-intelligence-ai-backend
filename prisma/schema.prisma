@@ -1,0 +1,499 @@
+// Creator Intelligence AI - PostgreSQL schema (Prisma ORM)
+// All user-owned rows carry userId with cascading delete => user-level data isolation.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Users, sessions, Google OAuth
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  displayName   String
+  avatarUrl     String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  sessions      UserSession[]
+  googleConnections GoogleConnection[]
+  channels      Channel[]
+  competitors   Competitor[]
+  savedKeywords SavedKeyword[]
+  keywordLists  KeywordList[]
+  keywordQueries KeywordQuery[]
+  seoAudits     SeoAudit[]
+  generatedContent GeneratedContent[]
+  aiConversations AiConversation[]
+  aiProviders   AiProvider[]
+  aiUsages      AiUsage[]
+  preferences   UserPreferences?
+  notifications Notification[]
+  workspaceItems WorkspaceItem[]
+  jobRuns       JobRun[]
+  notificationSettings NotificationSettings?
+
+  @@map("users")
+}
+
+model UserSession {
+  id           String    @id @default(cuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash    String    @unique // SHA-256 of the issued access token (jti)
+  refreshHash  String?   @unique
+  userAgent    String?
+  expiresAt    DateTime
+  createdAt    DateTime  @default(now())
+  revokedAt    DateTime?
+
+  @@index([userId])
+  @@map("user_sessions")
+}
+
+/// One connected Google account. Refresh tokens are AES-256-GCM encrypted at rest.
+model GoogleConnection {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  googleSub       String    @unique // stable Google account identifier
+  email           String
+  accessTokenEnc  String    @db.Text
+  refreshTokenEnc String?   @db.Text
+  tokenExpiresAt  DateTime
+  scopes          String[]
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  channels        Channel[]
+
+  @@index([userId])
+  @@map("google_connections")
+}
+
+// ---------------------------------------------------------------------------
+// Channels (owned) and history
+// ---------------------------------------------------------------------------
+
+model Channel {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  connectionId  String
+  connection    GoogleConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  ytChannelId   String
+  title         String
+  customUrl     String?
+  thumbnailUrl  String?
+  country       String?
+  uploadsPlaylistId String?
+  isActive      Boolean  @default(false)
+  lastSyncAt    DateTime?
+  createdAt     DateTime @default(now())
+
+  videos        Video[]
+  snapshots     ChannelSnapshot[]
+  analytics     AnalyticsRecord[]
+  quotaUsage    QuotaUsage[]
+  competitorComparisons Json?
+
+  @@unique([userId, ytChannelId])
+  @@index([userId])
+  @@map("channels")
+}
+
+model ChannelSnapshot {
+  id           String   @id @default(cuid())
+  channelId    String
+  channel      Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  subscribers  Int?
+  totalViews   BigInt?
+  videoCount   Int?
+  capturedAt   DateTime @default(now())
+
+  @@index([channelId, capturedAt])
+  @@map("channel_snapshots")
+}
+
+// ---------------------------------------------------------------------------
+// Videos (owned channels)
+// ---------------------------------------------------------------------------
+
+model Video {
+  id             String   @id @default(cuid())
+  channelId      String
+  channel        Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  ytVideoId      String   @unique
+  title          String
+  description    String   @db.Text
+  thumbnailUrl   String?
+  tags           String[]
+  publishedAt    DateTime
+  durationSeconds Int
+  isShort        Boolean
+  viewCount      BigInt?
+  likeCount      Int?
+  commentCount   Int?
+  lastStatsAt    DateTime?
+  createdAt      DateTime @default(now())
+
+  snapshots      VideoSnapshot[]
+  analytics      AnalyticsRecord[]
+
+  @@index([channelId, publishedAt])
+  @@map("videos")
+}
+
+model VideoSnapshot {
+  id           String   @id @default(cuid())
+  videoId      String
+  video        Video    @relation(fields: [videoId], references: [id], onDelete: Cascade)
+  viewCount    BigInt?
+  likeCount    Int?
+  commentCount Int?
+  capturedAt   DateTime @default(now())
+
+  @@index([videoId, capturedAt])
+  @@map("video_snapshots")
+}
+
+/// One row per video per day (or per channel per day when videoId is null).
+/// Metrics are stored exactly as reported by YouTube Analytics API; null = metric
+/// not available for that row. Never fabricate values.
+model AnalyticsRecord {
+  id            String   @id @default(cuid())
+  channelId     String
+  channel       Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  videoId       String?
+  video         Video?   @relation(fields: [videoId], references: [id], onDelete: Cascade)
+  date          DateTime @db.Date
+  views         Int?
+  estimatedWatchMinutes Int?
+  averageViewDurationSeconds Int?
+  subscribersGained      Int?
+  subscribersLost        Int?
+  likes         Int?
+  comments      Int?
+  impressions   Int?
+  impressionsCtr Float?  // 0-1 as reported by API
+  source        String   @default("youtube_analytics_api")
+  fetchedAt     DateTime @default(now())
+
+  @@unique([channelId, videoId, date])
+  @@index([channelId, date])
+  @@map("analytics_records")
+}
+
+// ---------------------------------------------------------------------------
+// Competitor intelligence (public data only - strictly separate from owned analytics)
+// ---------------------------------------------------------------------------
+
+model Competitor {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ytChannelId  String
+  title        String
+  thumbnailUrl String?
+  groupId      String?
+  addedVia     String   @default("search")
+  lastSyncAt   DateTime?
+  createdAt    DateTime @default(now())
+
+  snapshots    CompetitorSnapshot[]
+  videos       CompetitorVideo[]
+
+  @@unique([userId, ytChannelId])
+  @@index([userId])
+  @@map("competitors")
+}
+
+model CompetitorSnapshot {
+  id          String   @id @default(cuid())
+  competitorId String
+  competitor  Competitor @relation(fields: [competitorId], references: [id], onDelete: Cascade)
+  subscribers Int?
+  totalViews  BigInt?
+  videoCount  Int?
+  capturedAt  DateTime @default(now())
+
+  @@index([competitorId, capturedAt])
+  @@map("competitor_snapshots")
+}
+
+/// Public metadata of a competitor video. Views/likes/comments are PUBLIC counts
+/// as returned by the YouTube Data API - they are never mixed with private analytics.
+model CompetitorVideo {
+  id             String   @id @default(cuid())
+  competitorId   String
+  competitor     Competitor @relation(fields: [competitorId], references: [id], onDelete: Cascade)
+  ytVideoId      String   @unique
+  title          String
+  description    String   @db.Text
+  thumbnailUrl   String?
+  tags           String[]
+  publishedAt    DateTime
+  durationSeconds Int
+  isShort        Boolean
+  viewCount      BigInt?
+  likeCount      Int?
+  commentCount   Int?
+  lastStatsAt    DateTime?
+  createdAt      DateTime @default(now())
+
+  @@index([competitorId, publishedAt])
+  @@map("competitor_videos")
+}
+
+// ---------------------------------------------------------------------------
+// Keywords
+// ---------------------------------------------------------------------------
+
+/// History of keyword exploration queries (audit trail + reuse).
+model KeywordQuery {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  seed       String
+  resultJson Json
+  sources    String[]
+  createdAt  DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@map("keyword_queries")
+}
+
+model SavedKeyword {
+  id          String    @id @default(cuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  keyword     String
+  cluster     String?
+  intent      String?
+  opportunity Int?
+  factorsJson Json?
+  listId      String?
+  list        KeywordList? @relation(fields: [listId], references: [id], onDelete: SetNull)
+  createdAt   DateTime  @default(now())
+
+  @@unique([userId, keyword])
+  @@index([userId])
+  @@map("saved_keywords")
+}
+
+model KeywordList {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  note      String?
+  createdAt DateTime @default(now())
+
+  keywords  SavedKeyword[]
+
+  @@unique([userId, name])
+  @@map("keyword_lists")
+}
+
+// ---------------------------------------------------------------------------
+// SEO audits, generated content, workspace
+// ---------------------------------------------------------------------------
+
+model SeoAudit {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ytVideoId   String
+  videoTitle  String
+  overall     Int
+  reportJson  Json
+  createdAt   DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@map("seo_audits")
+}
+
+model GeneratedContent {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  kind      String   // idea_set | script | metadata | plan | title_set | description_set | tag_set
+  prompt    String   @db.Text
+  payload   Json
+  provider  String?
+  model     String?
+  createdAt DateTime @default(now())
+
+  @@index([userId, kind, createdAt])
+  @@map("generated_content")
+}
+
+/// Generic saved-workspace items (ideas, scripts, audits, reports...).
+model WorkspaceItem {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  kind      String
+  title     String
+  payload   Json
+  createdAt DateTime @default(now())
+
+  @@index([userId, kind, createdAt])
+  @@map("workspace_items")
+}
+
+// ---------------------------------------------------------------------------
+// AI conversations, providers, usage
+// ---------------------------------------------------------------------------
+
+model AiConversation {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channelId String?  // channel context for the conversation
+  title     String   @default("New conversation")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages  AiMessage[]
+
+  @@index([userId, updatedAt])
+  @@map("ai_conversations")
+}
+
+model AiMessage {
+  id             String   @id @default(cuid())
+  conversationId String
+  conversation   AiConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           String
+  content        String   @db.Text
+  dataReferences String[]
+  createdAt      DateTime @default(now())
+
+  @@index([conversationId, createdAt])
+  @@map("ai_messages")
+}
+
+/// User-configured AI provider (BYOK). API keys are AES-256-GCM encrypted at rest
+/// and are NEVER sent to the extension - only a boolean hasKey is exposed.
+model AiProvider {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  kind        String   // anthropic | openai | gemini
+  label       String
+  apiKeyEnc   String?  @db.Text
+  model       String
+  isDefault   Boolean  @default(false)
+  status      String   @default("unverified") // unverified | ok | error
+  lastError   String?
+  taskRouting Json?    // { task: providerId }
+  dailyRequestLimit Int?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([userId, kind])
+  @@map("ai_providers")
+}
+
+model AiUsage {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider        String
+  model           String
+  task            String
+  promptTokens    Int?
+  completionTokens Int?
+  ok              Boolean
+  error           String?
+  latencyMs       Int?
+  createdAt       DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@map("ai_usage")
+}
+
+// ---------------------------------------------------------------------------
+// Preferences, notifications, jobs, quota
+// ---------------------------------------------------------------------------
+
+model UserPreferences {
+  id          String  @id @default(cuid())
+  userId      String  @unique
+  user        User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  timezone    String  @default("UTC")
+  theme       String  @default("dark")
+  brandName   String  @default("Creator Intelligence AI")
+  overlaysEnabled Boolean @default(true)
+  updatedAt   DateTime @updatedAt
+
+  @@map("user_preferences")
+}
+
+model NotificationSettings {
+  id                  String  @id @default(cuid())
+  userId              String  @unique
+  user                User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  performance         Boolean @default(true)
+  competitorUploads   Boolean @default(true)
+  competitorSignals   Boolean @default(true)
+  growth              Boolean @default(true)
+  opportunities       Boolean @default(true)
+  syncFailures        Boolean @default(true)
+  quietStartHour      Int?
+  quietEndHour        Int?
+  updatedAt           DateTime @updatedAt
+
+  @@map("notification_settings")
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      String
+  title     String
+  body      String    @db.Text
+  payload   Json?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, createdAt])
+  @@map("notifications")
+}
+
+model JobRun {
+  id         String    @id @default(cuid())
+  userId     String?
+  user       User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  job        String
+  status     String    @default("queued") // queued | running | ok | failed
+  detail     String?
+  startedAt  DateTime?
+  finishedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([job, status, createdAt])
+  @@map("job_runs")
+}
+
+/// Daily YouTube API quota consumption per user (units as defined by Google).
+model QuotaUsage {
+  id        String   @id @default(cuid())
+  channelId String
+  channel   Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  date      DateTime @db.Date
+  service   String   // data_api | analytics_api
+  unitsUsed Int      @default(0)
+
+  @@unique([channelId, date, service])
+  @@map("quota_usage")
+}
